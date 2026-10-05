@@ -1,0 +1,103 @@
+rules_version = '2';
+// قواعد الحماية لنظام جداول التمريض — تُنسخ كما هي في Firebase › Firestore › Rules
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn()  { return request.auth != null; }
+    function meDoc()     { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function me()        { return get(meDoc()).data; }
+    function active()    { return signedIn() && exists(meDoc()) && me().active == true; }
+    function isAdmin()   { return active() && me().role == 'admin'; }
+    function isManager() { return active() && me().role == 'manager'; }
+    function isHead()    { return active() && me().role == 'head'; }
+    function hasUnit(u)  { return isAdmin() || (active() && u in me().units); }
+    function setupDoc()  { return /databases/$(database)/documents/meta/setup; }
+    function isBootstrapAdmin() { return signedIn() && exists(setupDoc()) && get(setupDoc()).data.adminUid == request.auth.uid; }
+
+    // First-time setup marker (created once by the first admin)
+    match /meta/setup {
+      allow read: if true;
+      allow create: if signedIn() && !exists(setupDoc()) && request.resource.data.adminUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Employee number → sign-in alias (no personal data)
+    match /logins/{empNo} {
+      allow read: if true;
+      allow write: if isAdmin() || isBootstrapAdmin();
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if isAdmin() || (request.auth.uid == uid && isBootstrapAdmin() && request.resource.data.role == 'admin');
+      allow update: if isAdmin()
+        || (request.auth.uid == uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mustChangePw','lang']));
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{id} { allow read: if active(); allow write: if isAdmin(); }
+    match /units/{id}    { allow read: if active(); allow write: if isAdmin(); }
+
+    // Staff records: only the system admin adds, edits and transfers
+    match /staff/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow write: if isAdmin();
+    }
+
+    match /schedules/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create: if isAdmin()
+        || ((isHead() || isManager()) && hasUnit(request.resource.data.unitId) && request.resource.data.status == 'draft');
+      allow update: if isAdmin()
+        || (isHead() && hasUnit(resource.data.unitId) && request.resource.data.unitId == resource.data.unitId
+            && resource.data.status in ['draft','returned'] && request.resource.data.status in ['draft','returned','submitted'])
+        || (isManager() && hasUnit(resource.data.unitId) && request.resource.data.unitId == resource.data.unitId);
+      allow delete: if isAdmin();
+    }
+
+    match /requests/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create, update: if isAdmin() || ((isHead() || isManager()) && hasUnit(request.resource.data.unitId));
+      allow delete: if isAdmin() || ((isHead() || isManager()) && hasUnit(resource.data.unitId));
+    }
+
+    // Leave & swaps: head nurse = initial approval, manager = final approval
+    match /leaves/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create: if (isAdmin() || isHead() || isManager()) && hasUnit(request.resource.data.unitId) && request.resource.data.status == 'prelim';
+      allow update: if isAdmin()
+        || (isManager() && hasUnit(resource.data.unitId))
+        || (isHead() && hasUnit(resource.data.unitId) && resource.data.status == 'prelim' && request.resource.data.status == 'prelim');
+      allow delete: if isAdmin() || ((isHead() || isManager()) && hasUnit(resource.data.unitId) && resource.data.status == 'prelim');
+    }
+    match /swaps/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create: if (isAdmin() || isHead() || isManager()) && hasUnit(request.resource.data.unitId) && request.resource.data.status == 'prelim';
+      allow update: if isAdmin()
+        || (isManager() && hasUnit(resource.data.unitId))
+        || (isHead() && hasUnit(resource.data.unitId) && resource.data.status == 'prelim' && request.resource.data.status == 'prelim');
+      allow delete: if isAdmin() || ((isHead() || isManager()) && hasUnit(resource.data.unitId) && resource.data.status == 'prelim');
+    }
+
+    // Annual leave plan (head nurse / manager for their units)
+    match /plans/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create, update: if (isAdmin() || isHead() || isManager()) && hasUnit(request.resource.data.unitId);
+      allow delete: if (isAdmin() || isHead() || isManager()) && hasUnit(resource.data.unitId);
+    }
+
+    // Balances: automatic (holiday / Ramadan) on approval, or manual by manager/admin
+    match /credits/{id} {
+      allow read: if hasUnit(resource.data.unitId);
+      allow create, update: if isAdmin() || (isManager() && hasUnit(request.resource.data.unitId));
+      allow delete: if isAdmin() || (isManager() && hasUnit(resource.data.unitId));
+    }
+
+    // Activity log: append-only
+    match /audit/{id} {
+      allow read: if isAdmin();
+      allow create: if active() && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
